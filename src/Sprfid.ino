@@ -19,11 +19,13 @@
 #include "Config.h"
 
 
-char scope[] = "user-read-playback-state%20user-modify-playback-state";
-char callbackURItemplate[] = "%s%s%s";
-char callbackURIProtocol[] = "http%3A%2F%2F"; // "http://"
-char callbackURIAddress[] = "%2Fcallback%2F"; // "/callback/"
+const char scope[] = "user-read-playback-state%20user-modify-playback-state";
+const char callbackURItemplate[] = "%s%s%s";
+const char callbackURIProtocol[] = "http%3A%2F%2F"; // "http://"
+const char callbackURIAddress[] = "%2Fcallback%2F"; // "/callback/"
 char callbackURI[100];
+
+const char PROPERTY_DEVICE[] = "device";
 
 
 // including a "spotify_server_cert" variable
@@ -35,7 +37,10 @@ DNSServer dns;
 WiFiClientSecure client;
 ArduinoSpotify spotify(client, clientId, clientSecret, refreshToken);
 
-bool doUpdate = false;
+Preferences preferences;
+
+bool updateSpotify = false;
+bool updateDevice = false;
 
 CurrentlyPlaying playing;
 #define MAX_DEVICES 10
@@ -55,6 +60,7 @@ struct UID {
 UID lastUid;
 
 char playbackDeviceId[41] = {0};
+char storeURI[61] = "";
 
 void handleRoot(AsyncWebServerRequest *request)
 {
@@ -63,6 +69,13 @@ void handleRoot(AsyncWebServerRequest *request)
     String device = deviceParam->value();
     strncpy(playbackDeviceId, device.c_str(), 40);
     Serial.printf("New playback device: %s\n", playbackDeviceId);
+    updateDevice = true;
+  }
+  if(request->hasParam("uri", true)) {
+    AsyncWebParameter *uriParam = request->getParam("uri", true);
+    String uri = uriParam->value();
+    strncpy(storeURI, uri.c_str(), 60);
+    Serial.printf("New URI to store: %s\n", storeURI);
   }
 
   AsyncResponseStream *response = request->beginResponseStream("text/html");
@@ -74,23 +87,35 @@ void handleRoot(AsyncWebServerRequest *request)
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <style>
+      body {
+        font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji";
+      }
+    </style>
   </head>
   <body>
   )");
 
+  if(strlen(storeURI) > 0) {
+    const char pairing[] = "<p><strong>Pairing mode active!</strong> %s is going to be written onto the next tag placed on the device</p>";
+    response->printf(pairing, storeURI);
+  }
+  
 
-  const char *currentlyPlaying = "<p>Currently Playing: %s - %s</p>";
+  const char currentlyPlaying[] = "<p>Currently Playing: %s - %s</p>";
   response->printf(currentlyPlaying, playing.trackName, playing.firstArtistName);
 
-  response->print("<form action=\"/\" method=\"post\"><label for=\"device\">Playing on: </label><select name=\"device\" id=\"device\"><option value=\"\"></option>");
+  response->print("<p><form action=\"/\" method=\"post\"><label for=\"device\">Playing on: </label><select name=\"device\" id=\"device\"><option value=\"\"></option>");
 
-  const char *deviceTpl = "<option value=\"%s\"%s>%s</option>";
+  const char deviceTpl[] = "<option value=\"%s\"%s>%s</option>";
   for(uint8_t i = 0; i < numDevices; i++) {
-    response->printf(deviceTpl, devices[i].id, ((strcmp(playbackDeviceId, devices[i].id) == 0) ? " selected" : ""), devices[i].name);;
+    response->printf(deviceTpl, devices[i].id, ((strcmp(playbackDeviceId, devices[i].id) == 0) ? " selected" : ""), devices[i].name);
   }
-  response->print("</select> <input type=\"submit\" value=\"set target\"></form>");
+  response->print("</select> <input type=\"submit\" value=\"set target\"></form></p>");
 
-  const char *authLinkTpl = "<p><a href=\"https://accounts.spotify.com/authorize?client_id=%s&response_type=code&redirect_uri=%s&scope=%s\">spotify Auth</a></p>";
+  response->printf("<p><form action=\"/\" method=\"post\"><label for=\"album\">Spotify URI: </label><input name=\"uri\" id=\"uri\" type=\"text\" size=\"60\" value=\"%s\"><input type=\"submit\" value=\"save to tag\"></form></p>", playing.albumUri);
+
+  const char authLinkTpl[] = "<p><a href=\"https://accounts.spotify.com/authorize?client_id=%s&response_type=code&redirect_uri=%s&scope=%s\">spotify Auth</a></p>";
   response->printf(authLinkTpl, clientId, callbackURI, scope);
 
   response->print(R"(
@@ -99,7 +124,7 @@ void handleRoot(AsyncWebServerRequest *request)
 )")
 ;
   request->send(response);
-  doUpdate=true;
+  updateSpotify=true;
 }
 
 void handleCallback(AsyncWebServerRequest *request)
@@ -125,41 +150,11 @@ void handleCallback(AsyncWebServerRequest *request)
   }
 }
 
-void handleNotFound(AsyncWebServerRequest *request)
-{
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += request->url();
-  message += "\nMethod: ";
-  message += (request->method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += request->args();
-  message += "\n";
-
-  for (uint8_t i = 0; i < request->args(); i++)
-  {
-    message += " " + request->argName(i) + ": " + request->arg(i) + "\n";
-  }
-
-  Serial.print(message);
-  request->send(404, "text/plain", message);
-}
-
 void startWifi() {
   Serial.println("Connecting Wifi");
 
   AsyncWiFiManager wifiManager(&server,&dns);
-
-  wifiManager.setConfigPortalTimeout(30);
-  uint8_t i = 0;
-  while(!wifiManager.autoConnect("sprfid", "rfidrfid", 5) && i++ < 3) {
-    Serial.println("Retry autoConnect");
-    WiFi.disconnect();
-    WiFi.mode(WIFI_OFF);
-  }
-  if(!WiFi.isConnected()) {
-    wifiManager.autoConnect("sprfid", "rfidrfid");
-  }
+  wifiManager.autoConnect("sprfid", "rfidrfid");
 
   Serial.print("WiFi connected with IP: "); Serial.println(WiFi.localIP());
   
@@ -177,9 +172,22 @@ void handleRfid() {
 
   NfcTag tag = nfc.read();
   if(!tag.hasNdefMessage()) {
-    Serial.println("Ignoring non Ndef tag");
-    nfc.haltTag();
-    return;
+    if(storeURI[0] == '\0') {
+      Serial.println("Ignoring non Ndef tag");
+      nfc.haltTag();
+      return;
+    }
+
+    nfc.format();
+  }
+
+  if(storeURI[0] != '\0') {
+      NdefMessage message = NdefMessage();
+      message.addUriRecord(storeURI);
+      if(nfc.write(message)) {
+        storeURI[0] = '\0';
+      }
+      tag = nfc.read();
   }
 
   /*UID tagUid;
@@ -190,10 +198,12 @@ void handleRfid() {
     return;
   }*/
 
-  size_t count = tag.getNdefMessage().getRecordCount();
+  NdefMessage msg = tag.getNdefMessage();
+
+  size_t count = msg.getRecordCount();
   Serial.printf("Found %d records\n", count);
   for(uint8_t i=0; i < count; i++) {
-    NdefRecord record = tag.getNdefMessage().getRecord(i);
+    NdefRecord record = msg.getRecord(i);
     if(!((record.getTnf() == NdefRecord::TNF_WELL_KNOWN) && (record.getTypeLength() == 1) && (record.getType()[0] == NdefRecord::RTD_URI))) {
       Serial.println("Ignoring non-URI record");
       continue;
@@ -234,6 +244,7 @@ void handleRfid() {
 
   // No spotify tags
   nfc.haltTag();
+  Serial.println("No spotify tags found");
 }
 
 void setup()
@@ -259,7 +270,6 @@ void setup()
 
   server.on("/", handleRoot);
   server.on("/callback/", handleCallback);
-  server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("HTTP server started");
 
@@ -267,15 +277,28 @@ void setup()
 
   numDevices = spotify.getDevices(devices, sizeof(devices)/sizeof(devices[0]));
 
+  preferences.begin("sprfid", true);
+  preferences.getString(PROPERTY_DEVICE, playbackDeviceId, sizeof(playbackDeviceId));
+  preferences.end();
+  Serial.print("Playback device: "); Serial.println(playbackDeviceId);
+
   Serial.println("Setup done");
 }
 void loop()
 {
   handleRfid();
 
-  if(doUpdate) {
+  if(updateDevice) {
+    preferences.begin("sprfid", false);
+    preferences.putString(PROPERTY_DEVICE, playbackDeviceId);
+    preferences.end();
+    updateDevice = false;
+  }
+
+  if(updateSpotify) {
     playing = spotify.getCurrentlyPlaying("DE");
 
     numDevices = spotify.getDevices(devices, sizeof(devices)/sizeof(devices[0]));
+    updateSpotify = false;
   }
 }
