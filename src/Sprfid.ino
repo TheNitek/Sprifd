@@ -1,14 +1,9 @@
-#ifdef ESP32
-  #include <WiFi.h>
-  #include <AsyncTCP.h>
-  #include <ESPmDNS.h>
-#else
-  #include <ESP8266WiFi.h>
-  #include <ESPAsyncTCP.h>
-  #include <ESP8266mDNS.h>
-#endif
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPAsyncWiFiManager.h>
+#include <AsyncElegantOTA.h>
 #include <MFRC522.h>
 #include <NfcAdapter.h>
 #include <WiFiClientSecure.h>
@@ -39,28 +34,31 @@ ArduinoSpotify spotify(client, clientId, clientSecret, refreshToken);
 
 Preferences preferences;
 
-bool updateSpotify = false;
-bool updateDevice = false;
-
 CurrentlyPlaying playing;
 #define MAX_DEVICES 10
 SpotifyDevice devices[MAX_DEVICES];
 uint8_t numDevices = 0;
 
 #define SS_PIN 33
+#define RST_PIN 25
 
-MFRC522 mfrc522(SS_PIN, UINT8_MAX); // Create MFRC522 instance
+MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
 NfcAdapter nfc(&mfrc522);
 
 struct UID {
   byte uidByte[10];
-  uint8_t uidSize;
+  uint8_t uidSize=sizeof(uidByte);
 };
 
 UID lastUid;
+int lastRfidCheck = 0;
 
 char playbackDeviceId[41] = {0};
 char storeURI[61] = "";
+
+bool updateSpotify = false;
+bool updateDevice = false;
+bool playbackStarted = false;
 
 void handleRoot(AsyncWebServerRequest *request)
 {
@@ -166,6 +164,32 @@ void startWifi() {
 
 
 void handleRfid() {
+  if(millis() - lastRfidCheck < 500) {
+    return;
+  }
+  lastRfidCheck = millis();
+
+  if(playbackStarted) {
+    for (uint8_t i = 0; i < 3; i++) {
+      // Detect Tag without looking for collisions
+      byte bufferATQA[2];
+      byte bufferSize = sizeof(bufferATQA);
+
+      MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
+
+      if (result == mfrc522.STATUS_OK && mfrc522.PICC_ReadCardSerial() && memcmp(mfrc522.uid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0) {
+        mfrc522.PICC_HaltA();
+        return;
+      }
+    }
+    Serial.println("Stopping playback");
+    spotify.pause();
+    lastUid.uidSize = 0;
+    playbackStarted = false;
+    return;
+  }
+
+
   if(!nfc.tagPresent()) {
     return;
   }
@@ -192,9 +216,8 @@ void handleRfid() {
 
   /*UID tagUid;
   tag.getUid(tagUid.uidByte, tagUid.uidSize);
-  if((lastUid.uidSize == tagUid.uidSize) && memcmp(tagUid.uidByte, lastUid.uidByte, lastUid.uidSize)) {
+  if((lastUid.uidSize == tagUid.uidSize) && (memcmp(tagUid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0)) {
     Serial.print(".");
-    nfc.haltTag();
     return;
   }*/
 
@@ -234,17 +257,17 @@ void handleRfid() {
     char body[100];
     sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
     yield();
-    if (spotify.playAdvanced(body, playbackDeviceId)) {
-        tag.getUid(lastUid.uidByte, lastUid.uidSize);
-        nfc.haltTag();
-        Serial.printf("Started playback for %s\n", uri);
-        return;
-    }
+    playbackStarted = spotify.playAdvanced(body, playbackDeviceId);
+    lastUid.uidSize=sizeof(lastUid.uidByte);
+    tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
+    Serial.printf("Started playback for %s\n", uri);
+    nfc.haltTag();
+    return;
   }
 
   // No spotify tags
   nfc.haltTag();
-  Serial.println("No spotify tags found");
+  Serial.println("No spotify records found");
 }
 
 void setup()
@@ -259,11 +282,7 @@ void setup()
 
   // If you want to enable some extra debugging
   // uncomment the "#define SPOTIFY_DEBUG" in ArduinoSpotify.h
-#ifdef ESP32
   client.setCACert(spotify_server_cert);
-#else
-  client.setFingerprint(SPOTIFY_FINGERPRINT);
-#endif
 
   // Building up callback URL using IP address.
   sprintf(callbackURI, callbackURItemplate, callbackURIProtocol, "sprfid", callbackURIAddress);
@@ -272,6 +291,9 @@ void setup()
   server.on("/callback/", handleCallback);
   server.begin();
   Serial.println("HTTP server started");
+
+  AsyncElegantOTA.begin(&server);
+  Serial.println("OTA setup");
 
   playing = spotify.getCurrentlyPlaying("DE");
 
@@ -286,6 +308,8 @@ void setup()
 }
 void loop()
 {
+  AsyncElegantOTA.loop();
+
   handleRfid();
 
   if(updateDevice) {
