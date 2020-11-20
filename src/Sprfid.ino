@@ -17,7 +17,7 @@
 const char scope[] = "user-read-playback-state%20user-modify-playback-state";
 const char callbackURItemplate[] = "%s%s%s";
 const char callbackURIProtocol[] = "http%3A%2F%2F"; // "http://"
-const char callbackURIAddress[] = "%2Fcallback%2F"; // "/callback/"
+const char callbackURIAddress[] = "%2Fcallback"; // "/callback/"
 char callbackURI[100];
 
 const char PROPERTY_DEVICE[] = "device";
@@ -45,6 +45,8 @@ uint8_t numDevices = 0;
 MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
 NfcAdapter nfc(&mfrc522);
 
+const char NDEF_DOMAIN[] = "com.github:nitek/sprfid";
+
 struct UID {
   byte uidByte[10];
   uint8_t uidSize=sizeof(uidByte);
@@ -53,8 +55,20 @@ struct UID {
 UID lastUid;
 int lastRfidCheck = 0;
 
+struct PlaybackOptions {
+  bool shuffle: 1;
+  bool repeat: 1;
+};
+
 char playbackDeviceId[41] = {0};
-char storeURI[61] = "";
+
+struct {
+  char uri[61] = "";
+  PlaybackOptions options {
+    .shuffle = false,
+    .repeat = true
+  };
+} writeCache;
 
 bool updateSpotify = false;
 bool updateDevice = false;
@@ -62,20 +76,6 @@ bool playbackStarted = false;
 
 void handleRoot(AsyncWebServerRequest *request)
 {
-  if(request->hasParam("device", true)) {
-    AsyncWebParameter *deviceParam = request->getParam("device", true);
-    String device = deviceParam->value();
-    strncpy(playbackDeviceId, device.c_str(), 40);
-    Serial.printf("New playback device: %s\n", playbackDeviceId);
-    updateDevice = true;
-  }
-  if(request->hasParam("uri", true)) {
-    AsyncWebParameter *uriParam = request->getParam("uri", true);
-    String uri = uriParam->value();
-    strncpy(storeURI, uri.c_str(), 60);
-    Serial.printf("New URI to store: %s\n", storeURI);
-  }
-
   AsyncResponseStream *response = request->beginResponseStream("text/html");
 
   response->print(R"(
@@ -94,16 +94,16 @@ void handleRoot(AsyncWebServerRequest *request)
   <body>
   )");
 
-  if(strlen(storeURI) > 0) {
-    const char pairing[] = "<p><strong>Pairing mode active!</strong> %s is going to be written onto the next tag placed on the device</p>";
-    response->printf(pairing, storeURI);
+  if(strlen(writeCache.uri) > 0) {
+    const char pairing[] = "<p><strong>Pairing mode active!</strong> \"%s\" is going to be written onto the next tag placed on the device</p>";
+    response->printf(pairing, writeCache.uri);
   }
   
 
   const char currentlyPlaying[] = "<p>Currently Playing: %s - %s</p>";
   response->printf(currentlyPlaying, playing.trackName, playing.firstArtistName);
 
-  response->print("<p><form action=\"/\" method=\"post\"><label for=\"device\">Playing on: </label><select name=\"device\" id=\"device\"><option value=\"\"></option>");
+  response->print("<p><form action=\"/save\" method=\"post\"><label for=\"device\">Playing on: </label><select name=\"device\" id=\"device\"><option value=\"\"></option>");
 
   const char deviceTpl[] = "<option value=\"%s\"%s>%s</option>";
   for(uint8_t i = 0; i < numDevices; i++) {
@@ -111,18 +111,46 @@ void handleRoot(AsyncWebServerRequest *request)
   }
   response->print("</select> <input type=\"submit\" value=\"set target\"></form></p>");
 
-  response->printf("<p><form action=\"/\" method=\"post\"><label for=\"album\">Spotify URI: </label><input name=\"uri\" id=\"uri\" type=\"text\" size=\"60\" value=\"%s\"><input type=\"submit\" value=\"save to tag\"></form></p>", playing.albumUri);
+  response->printf(
+    "<p><form action=\"/save\" method=\"post\">"
+      "<label for=\"album\">Spotify URI:</label> <input name=\"uri\" id=\"uri\" type=\"text\" size=\"60\" value=\"%s\"><br>"
+      "<label for=\"shuffle\">Shuffle:</label> <input name=\"shuffle\" id=\"shuffle\" type=\"checkbox\" value=\"1\" %s><br>"
+      "<label for=\"repeat\">Repeat:</label> <input name=\"repeat\" id=\"repeat\" type=\"checkbox\" value=\"1\" %s><br>"
+      "<input type=\"submit\" value=\"save to tag\">"
+    "</form></p>", 
+    (writeCache.uri[0] == '\0') ? playing.albumUri : writeCache.uri,
+    (writeCache.options.shuffle) ? "checked" : "",
+    (writeCache.options.repeat) ? "checked" : ""
+  );
 
   const char authLinkTpl[] = "<p><a href=\"https://accounts.spotify.com/authorize?client_id=%s&response_type=code&redirect_uri=%s&scope=%s\">spotify Auth</a></p>";
   response->printf(authLinkTpl, clientId, callbackURI, scope);
 
-  response->print(R"(
-  </body>
-</html>
-)")
-;
+  response->print("</body></html>");
   request->send(response);
   updateSpotify=true;
+}
+
+void handleSave(AsyncWebServerRequest *request)
+{
+  if(request->hasParam("device", true)) {
+    AsyncWebParameter *deviceParam = request->getParam("device", true);
+    String device = deviceParam->value();
+    strncpy(playbackDeviceId, device.c_str(), 40);
+    Serial.printf("New playback device: %s\n", playbackDeviceId);
+    updateDevice = true;
+  }
+  if(request->hasParam("uri", true)) {
+    AsyncWebParameter *uriParam = request->getParam("uri", true);
+    String uri = uriParam->value();
+    strncpy(writeCache.uri, uri.c_str(), 60);
+    Serial.printf("New URI to store: %s\n", writeCache.uri);
+    writeCache.options.shuffle = request->hasParam("shuffle", true);
+    Serial.printf("New shuffle: %d\n", writeCache.options.shuffle);
+    writeCache.options.repeat = request->hasParam("repeat", true);
+    Serial.printf("New repeat: %d\n", writeCache.options.repeat);
+  }
+  request->redirect("/");
 }
 
 void handleCallback(AsyncWebServerRequest *request)
@@ -171,7 +199,6 @@ void handleRfid() {
 
   if(playbackStarted) {
     for (uint8_t i = 0; i < 3; i++) {
-      // Detect Tag without looking for collisions
       byte bufferATQA[2];
       byte bufferSize = sizeof(bufferATQA);
 
@@ -195,31 +222,45 @@ void handleRfid() {
   }
 
   NfcTag tag = nfc.read();
-  if(!tag.hasNdefMessage()) {
-    if(storeURI[0] == '\0') {
-      Serial.println("Ignoring non Ndef tag");
+
+  if(!tag.isFormatted()) {
+    if(writeCache.uri[0] == '\0') {
+      Serial.println("Ignoring unformatted tag");
       nfc.haltTag();
       return;
     }
 
-    nfc.format();
+    Serial.print("Not formatted. Wakeing tag up again");
+    byte bufferATQA[2];
+    byte bufferSize = sizeof(bufferATQA);
+
+    if((mfrc522.PICC_WakeupA(bufferATQA, &bufferSize) == mfrc522.STATUS_OK) && mfrc522.PICC_ReadCardSerial()){
+      Serial.println("Formatting tag");
+      if(!nfc.format()) {
+        Serial.println("Formatting failed");
+        return;
+      }
+    }
   }
 
-  if(storeURI[0] != '\0') {
+  if(writeCache.uri[0] != '\0') {
       NdefMessage message = NdefMessage();
-      message.addUriRecord(storeURI);
+      message.addUriRecord(writeCache.uri);
+      message.addExternalRecord(NDEF_DOMAIN, (byte*)&(writeCache.options), sizeof(writeCache.options));
       if(nfc.write(message)) {
-        storeURI[0] = '\0';
+        Serial.println("Wrote data to tag");
+        writeCache.uri[0] = '\0';
+      } else {
+        Serial.println("Failed to write tag");
       }
       tag = nfc.read();
   }
 
-  /*UID tagUid;
-  tag.getUid(tagUid.uidByte, tagUid.uidSize);
-  if((lastUid.uidSize == tagUid.uidSize) && (memcmp(tagUid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0)) {
-    Serial.print(".");
-    return;
-  }*/
+  if(!tag.hasNdefMessage()) {
+      Serial.println("Ignoring non Ndef tag");
+      nfc.haltTag();
+      return;
+  }
 
   NdefMessage msg = tag.getNdefMessage();
 
@@ -227,47 +268,55 @@ void handleRfid() {
   Serial.printf("Found %d records\n", count);
   for(uint8_t i=0; i < count; i++) {
     NdefRecord record = msg.getRecord(i);
-    if(!((record.getTnf() == NdefRecord::TNF_WELL_KNOWN) && (record.getTypeLength() == 1) && (record.getType()[0] == NdefRecord::RTD_URI))) {
-      Serial.println("Ignoring non-URI record");
+
+    if((record.getTnf() == NdefRecord::TNF_EXTERNAL_TYPE) && 
+      (record.getTypeLength() == strlen(NDEF_DOMAIN)) &&
+      (memcmp(record.getType(), (byte *)NDEF_DOMAIN, record.getTypeLength()) == 0) &&
+      record.getPayloadLength() == 1) {
+        const PlaybackOptions *options = (PlaybackOptions *)record.getPayload();
+        Serial.printf("Shuffle %d\n", options->shuffle);
+        Serial.printf("Repeat %d\n", options->repeat);
+        spotify.toggleShuffle(options->shuffle);
+        spotify.setRepeatMode(options->repeat ? repeat_context : repeat_off);
+    } else if((record.getTnf() == NdefRecord::TNF_WELL_KNOWN) && (record.getTypeLength() == 1) && (record.getType()[0] == NdefRecord::RTD_URI)) {
+      unsigned int payloadLength = record.getPayloadLength();
+      const byte *payload = record.getPayload();
+      if(payloadLength < 10) {
+        Serial.println("Too short for spotify URI - ignoring");
+        continue;
+      }
+
+      // Maxlength is 40, but first byte is RTD and will be cut off)
+      if(payloadLength > 41) {
+        Serial.println("Too long for spotify URI - ignoring");
+        continue;
+      }
+
+      // One more for \0
+      char uri[41] = {0};
+      memcpy(uri, payload+1, payloadLength-1);
+
+      if(strncmp(uri, "spotify", 7) != 0) {
+        Serial.println("URI not does not start with \"spotify\"");
+        continue;
+      }
+
+      char body[100];
+      sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
+      yield();
+      playbackStarted = spotify.playAdvanced(body, playbackDeviceId);
+      lastUid.uidSize=sizeof(lastUid.uidByte);
+      tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
+      Serial.printf("Started playback for %s\n", uri);
+    } else {
+      Serial.println("Ignoring record");
       continue;
     }
-
-    unsigned int payloadLength = record.getPayloadLength();
-    const byte *payload = record.getPayload();
-    if(payloadLength < 10) {
-      Serial.println("Too short for spotify URI - ignoring");
-      continue;
-    }
-
-    // Maxlength is 40, but first byte is RTD and will be cut off)
-    if(payloadLength > 41) {
-      Serial.println("Too long for spotify URI - ignoring");
-      continue;
-    }
-
-    // One more for \0
-    char uri[41] = {0};
-    memcpy(uri, payload+1, payloadLength-1);
-
-    if(strncmp(uri, "spotify", 7) != 0) {
-      Serial.println("URI not does not start with \"spotify\"");
-      continue;
-    }
-
-    char body[100];
-    sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
-    yield();
-    playbackStarted = spotify.playAdvanced(body, playbackDeviceId);
-    lastUid.uidSize=sizeof(lastUid.uidByte);
-    tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
-    Serial.printf("Started playback for %s\n", uri);
-    nfc.haltTag();
-    return;
-  }
+}
 
   // No spotify tags
   nfc.haltTag();
-  Serial.println("No spotify records found");
+  Serial.println("Done with tag");
 }
 
 void setup()
@@ -288,7 +337,8 @@ void setup()
   sprintf(callbackURI, callbackURItemplate, callbackURIProtocol, "sprfid", callbackURIAddress);
 
   server.on("/", handleRoot);
-  server.on("/callback/", handleCallback);
+  server.on("/save", handleSave);
+  server.on("/callback", handleCallback);
   server.begin();
   Serial.println("HTTP server started");
 

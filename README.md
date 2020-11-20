@@ -10,7 +10,7 @@ Control Spotify using RFID tags.
 
 ## Howto
 * Register an app with Spotify: https://developer.spotify.com/dashboard/applications/8092dd1787fd4fd489cada53ed9f592d
-* Add "http://sprfid/callback/" as redirect uri for this app
+* Add "http://sprfid/callback" as redirect uri for this app
 * Copy Config.tpl to Config.h and copy clientId and clientSecret from Spotify
 * Upload to the ESP
 * New WiFi access point "sprfid" should appear (Password is "rfidrfid")
