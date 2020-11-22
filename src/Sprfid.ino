@@ -72,6 +72,7 @@ struct {
 
 bool updateSpotify = false;
 bool updateDevice = false;
+bool updateRefreshToken = false;
 bool playbackStarted = false;
 
 void handleRoot(AsyncWebServerRequest *request)
@@ -155,15 +156,12 @@ void handleSave(AsyncWebServerRequest *request)
 
 void handleCallback(AsyncWebServerRequest *request)
 {
-  String code = "";
   const char *refreshToken = NULL;
-  for (uint8_t i = 0; i < request->args(); i++)
-  {
-    if (request->argName(i) == "code")
-    {
-      code = request->arg(i);
-      refreshToken = spotify.requestAccessTokens(code.c_str(), callbackURI);
-    }
+
+  if(request->hasParam("code")) {
+    AsyncWebParameter *codeParam = request->getParam("code");
+    String code = codeParam->value();
+    refreshToken = spotify.requestAccessTokens(code.c_str(), callbackURI);
   }
 
   if (refreshToken != NULL)
@@ -204,20 +202,39 @@ void handleRfid() {
 
       MFRC522::StatusCode result = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
 
-      if (result == mfrc522.STATUS_OK && mfrc522.PICC_ReadCardSerial() && memcmp(mfrc522.uid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0) {
+      if (result == mfrc522.STATUS_OK &&
+          mfrc522.PICC_ReadCardSerial() &&
+          mfrc522.uid.size == lastUid.uidSize &&
+          memcmp(mfrc522.uid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0) {
         mfrc522.PICC_HaltA();
         return;
       }
     }
-    Serial.println("Stopping playback");
-    spotify.pause();
-    lastUid.uidSize = 0;
-    playbackStarted = false;
+    Serial.println("Pausing playback");
+    if(spotify.pause()) {
+      playbackStarted = false;
+    } else {
+      playing = spotify.getCurrentlyPlaying("DE");
+      if(!playing.error && !playing.isPlaying) {
+        Serial.println("Pausing request failed, but no playback running");
+        playbackStarted = false;
+      } else {
+        Serial.println("Pausing failed");
+      }
+    }
     return;
   }
 
-
   if(!nfc.tagPresent()) {
+    return;
+  }
+  
+  if(mfrc522.uid.size == lastUid.uidSize &&
+      memcmp(mfrc522.uid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0) {
+    if(spotify.play()) {
+      Serial.println("Resumed playback");
+      playbackStarted = true;
+    }
     return;
   }
 
@@ -276,6 +293,7 @@ void handleRfid() {
         const PlaybackOptions *options = (PlaybackOptions *)record.getPayload();
         Serial.printf("Shuffle %d\n", options->shuffle);
         Serial.printf("Repeat %d\n", options->repeat);
+        yield();
         spotify.toggleShuffle(options->shuffle);
         spotify.setRepeatMode(options->repeat ? repeat_context : repeat_off);
     } else if((record.getTnf() == NdefRecord::TNF_WELL_KNOWN) && (record.getTypeLength() == 1) && (record.getType()[0] == NdefRecord::RTD_URI)) {
@@ -305,9 +323,11 @@ void handleRfid() {
       sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
       yield();
       playbackStarted = spotify.playAdvanced(body, playbackDeviceId);
-      lastUid.uidSize=sizeof(lastUid.uidByte);
-      tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
-      Serial.printf("Started playback for %s\n", uri);
+      if(playbackStarted) {
+        lastUid.uidSize=sizeof(lastUid.uidByte);
+        tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
+        Serial.printf("Started playback for %s\n", uri);
+      }
     } else {
       Serial.println("Ignoring record");
       continue;
@@ -329,9 +349,8 @@ void setup()
 
   startWifi();
 
-  // If you want to enable some extra debugging
-  // uncomment the "#define SPOTIFY_DEBUG" in ArduinoSpotify.h
   client.setCACert(spotify_server_cert);
+  client.setHandshakeTimeout(5);
 
   // Building up callback URL using IP address.
   sprintf(callbackURI, callbackURItemplate, callbackURIProtocol, "sprfid", callbackURIAddress);
@@ -346,7 +365,6 @@ void setup()
   Serial.println("OTA setup");
 
   playing = spotify.getCurrentlyPlaying("DE");
-
   numDevices = spotify.getDevices(devices, sizeof(devices)/sizeof(devices[0]));
 
   preferences.begin("sprfid", true);
@@ -356,6 +374,7 @@ void setup()
 
   Serial.println("Setup done");
 }
+
 void loop()
 {
   AsyncElegantOTA.loop();
