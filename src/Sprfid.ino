@@ -45,8 +45,8 @@ CurrentlyPlaying playing;
 SpotifyDevice devices[MAX_DEVICES];
 uint8_t numDevices = 0;
 
-#define SS_PIN 33
-#define RST_PIN 25
+#define SS_PIN 5
+#define RST_PIN 4
 
 MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
 NfcAdapter nfc(&mfrc522);
@@ -106,13 +106,13 @@ void handleRoot(AsyncWebServerRequest *request)
   
   if(refreshToken[0] != '\0') {
     const char currentlyPlaying[] = "<p>Currently Playing: %s - %s</p>";
-    response->printf(currentlyPlaying, playing.trackName, playing.firstArtistName);
+    response->printf(currentlyPlaying, playing.trackName.c_str(), playing.firstArtistName.c_str());
 
     response->print("<p><form action=\"/save\" method=\"post\"><label for=\"device\">Playing on: </label><select name=\"device\" id=\"device\"><option value=\"\"></option>");
 
     const char deviceTpl[] = "<option value=\"%s\"%s>%s</option>";
     for(uint8_t i = 0; i < numDevices; i++) {
-      response->printf(deviceTpl, devices[i].id, ((strcmp(playbackDeviceId, devices[i].id) == 0) ? " selected" : ""), devices[i].name);
+      response->printf(deviceTpl, devices[i].id.c_str(), ((strcmp(playbackDeviceId, devices[i].id.c_str()) == 0) ? " selected" : ""), devices[i].name.c_str());
     }
     response->print("</select> <input type=\"submit\" value=\"set target\"></form></p>");
 
@@ -123,7 +123,7 @@ void handleRoot(AsyncWebServerRequest *request)
         "<label for=\"repeat\">Repeat:</label> <input name=\"repeat\" id=\"repeat\" type=\"checkbox\" value=\"1\" %s><br>"
         "<input type=\"submit\" value=\"save to tag\">"
       "</form></p>", 
-      (tagWriteCache.uri[0] == '\0') ? playing.albumUri : tagWriteCache.uri,
+      (tagWriteCache.uri[0] == '\0') ? playing.contextUri.c_str() : tagWriteCache.uri,
       (tagWriteCache.options.shuffle) ? "checked" : "",
       (tagWriteCache.options.repeat) ? "checked" : ""
     );
@@ -255,7 +255,7 @@ void handleRfid() {
   if(!nfc.tagPresent()) {
     return;
   }
-  
+
   if(mfrc522.uid.size == lastUid.uidSize &&
       memcmp(mfrc522.uid.uidByte, lastUid.uidByte, lastUid.uidSize) == 0) {
     if(spotify->play()) {
@@ -274,7 +274,7 @@ void handleRfid() {
       return;
     }
 
-    Serial.print("Not formatted. Wakeing tag up again");
+    Serial.println("Not formatted. Wakeing tag up again");
     byte bufferATQA[2];
     byte bufferSize = sizeof(bufferATQA);
 
@@ -331,14 +331,13 @@ void handleRfid() {
         continue;
       }
 
-      // Maxlength is 40, but first byte is RTD and will be cut off)
-      if(payloadLength > 41) {
-        Serial.println("Too long for spotify URI - ignoring");
+      if(payloadLength > 100) {
+        Serial.println("URI too long - ignoring");
         continue;
       }
 
       // One more for \0
-      char uri[41] = {0};
+      char uri[101] = {0};
       memcpy(uri, payload+1, payloadLength-1);
 
       if(strncmp(uri, "spotify", 7) != 0) {
@@ -346,14 +345,17 @@ void handleRfid() {
         continue;
       }
 
-      char body[100];
+      char body[125];
       sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
+
       yield();
       playbackStarted = spotify->playAdvanced(body, playbackDeviceId);
       if(playbackStarted) {
         lastUid.uidSize=sizeof(lastUid.uidByte);
         tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
         Serial.printf("Started playback for %s\n", uri);
+      } else {
+        Serial.printf("Failed to start playback for %s\n", uri);
       }
     } else {
       Serial.println("Ignoring record");
