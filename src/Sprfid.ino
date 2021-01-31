@@ -13,8 +13,10 @@
 
 #include "Templates.h"
 
-#define DEBUG 1
+//#define DEBUG
+#define MAX_DEVICES 10
 
+char SPOTIFY_MARKET[] = "DE";
 char clientId[33] = "";     // Your client ID of your spotify APP
 char clientSecret[33] = ""; // Your client Secret of your spotify APP (Do Not share this!)
 char refreshToken[132] = "";
@@ -23,6 +25,7 @@ const char callbackURItemplate[] = "%s%s%s";
 const char callbackURIProtocol[] = "http%3A%2F%2F"; // "http://"
 const char callbackURIAddress[] = "%2Fcallback"; // "/callback/"
 
+const char NVS_NAMESPACE[] = "sprfid";
 const char PROPERTY_DEVICE[] = "device";
 const char PROPERTY_CLIENT_ID[] = "clientId";
 const char PROPERTY_CLIENT_SECRET[] = "clientSecret";
@@ -41,7 +44,6 @@ ArduinoSpotify *spotify = NULL;
 Preferences preferences;
 
 CurrentlyPlaying playing;
-#define MAX_DEVICES 10
 SpotifyDevice devices[MAX_DEVICES];
 uint8_t numDevices = 0;
 
@@ -87,6 +89,66 @@ struct {
 } nvsWriteCache;
 
 char oauthCode[250] = {0};
+
+bool retry( std::function<bool()> func) {
+  for( uint8_t attempt = 0; attempt < 3; ++attempt ) {
+    if( func() ) { return true; }
+  }
+  return false;
+}
+
+void flushNvsCache() {
+  if(updateDevice) {
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putString(PROPERTY_DEVICE, playbackDeviceId);
+    preferences.end();
+    updateDevice = false;
+  }
+
+  if(nvsWriteCache.clientId[0] != '\0' || nvsWriteCache.clientSecret[0] != '\0') {
+    Serial.println("Storing new credentials");
+    preferences.begin(NVS_NAMESPACE, false);
+    if(nvsWriteCache.clientId[0] != '\0') {
+      preferences.putString(PROPERTY_CLIENT_ID, nvsWriteCache.clientId);
+    }
+    if(nvsWriteCache.clientSecret[0] != '\0') {
+      preferences.putString(PROPERTY_CLIENT_SECRET, nvsWriteCache.clientSecret);
+    }
+    preferences.end();
+    ESP.restart();
+  }
+
+#ifdef DEBUG
+  if(clearNvs) {
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.clear();
+    preferences.end();
+    ESP.restart();
+  }
+#endif
+}
+
+void processOAuth() {
+  if(oauthCode[0] != '\0') {
+    const char *newRefreshToken = NULL;
+
+    char callbackURI[100];
+    sprintf(callbackURI, callbackURItemplate, callbackURIProtocol, "sprfid.local", callbackURIAddress);
+
+    newRefreshToken = spotify->requestAccessTokens(oauthCode, callbackURI);
+
+    if (newRefreshToken != NULL)
+    {
+      Serial.println("Storing refresh token");
+      preferences.begin(NVS_NAMESPACE, false);
+      preferences.putString(PROPERTY_REFRESH_TOKEN, newRefreshToken);
+      preferences.end();
+      strncpy(refreshToken, newRefreshToken, sizeof(refreshToken)-1);
+    }
+
+    oauthCode[0] = '\0';
+  }
+}
 
 void handleRoot(AsyncWebServerRequest *request)
 {
@@ -241,7 +303,7 @@ void handleRfid() {
     if(spotify->pause()) {
       playbackStarted = false;
     } else {
-      playing = spotify->getCurrentlyPlaying("DE");
+      playing = spotify->getCurrentlyPlaying(SPOTIFY_MARKET);
       if(!playing.error && !playing.isPlaying) {
         Serial.println("Pausing request failed, but no playback running");
         playbackStarted = false;
@@ -274,7 +336,7 @@ void handleRfid() {
       return;
     }
 
-    Serial.println("Not formatted. Wakeing tag up again");
+    Serial.println("Not formatted. Wakeing up tag again");
     byte bufferATQA[2];
     byte bufferSize = sizeof(bufferATQA);
 
@@ -322,7 +384,7 @@ void handleRfid() {
         Serial.printf("Repeat %d\n", options->repeat);
         yield();
         spotify->toggleShuffle(options->shuffle);
-        spotify->setRepeatMode(options->repeat ? repeat_context : repeat_off);
+        spotify->setRepeatMode(options->repeat ? REPEAT_CONTEXT : REPEAT_OFF);
     } else if((record.getTnf() == NdefRecord::TNF_WELL_KNOWN) && (record.getTypeLength() == 1) && (record.getType()[0] == NdefRecord::RTD_URI)) {
       unsigned int payloadLength = record.getPayloadLength();
       const byte *payload = record.getPayload();
@@ -349,10 +411,11 @@ void handleRfid() {
       sprintf(body, "{\"context_uri\" : \"%s\"}", uri);
 
       yield();
-      playbackStarted = spotify->playAdvanced(body, playbackDeviceId);
-      if(playbackStarted) {
+      retry([]() -> bool { return spotify->transferPlayback(playbackDeviceId, false); });
+      if(spotify->playAdvanced(body, playbackDeviceId)) {
         lastUid.uidSize=sizeof(lastUid.uidByte);
         tag.getUid(lastUid.uidByte, &(lastUid.uidSize));
+        playbackStarted = true;
         Serial.printf("Started playback for %s\n", uri);
       } else {
         Serial.printf("Failed to start playback for %s\n", uri);
@@ -366,6 +429,17 @@ void handleRfid() {
   // No spotify tags
   nfc.haltTag();
   Serial.println("Done with tag");
+}
+
+void loadSpotifyState() {
+  retry([]() -> bool {
+    playing = spotify->getCurrentlyPlaying(SPOTIFY_MARKET);
+    return !playing.error;
+  });
+  retry([]() -> bool {
+    numDevices = spotify->getDevices(devices, sizeof(devices)/sizeof(devices[0]));
+    return numDevices > 0;
+  });
 }
 
 void setup()
@@ -414,8 +488,8 @@ void setup()
 
       Serial.print("Playback device: "); Serial.println(playbackDeviceId);
 
-      playing = spotify->getCurrentlyPlaying("DE");
-      numDevices = spotify->getDevices(devices, sizeof(devices)/sizeof(devices[0]));
+      retry([]() -> bool { return spotify->refreshAccessToken(); });
+      loadSpotifyState();
     }
   } else {
     Serial.println("Spotify credentials missing");
@@ -428,61 +502,16 @@ void loop()
 {
   AsyncElegantOTA.loop();
 
-  if(updateDevice) {
-    preferences.begin("sprfid", false);
-    preferences.putString(PROPERTY_DEVICE, playbackDeviceId);
-    preferences.end();
-    updateDevice = false;
-  }
+  flushNvsCache();
 
-  if(nvsWriteCache.clientId[0] != '\0' || nvsWriteCache.clientSecret[0] != '\0') {
-    Serial.println("Storing new credentials");
-    preferences.begin("sprfid", false);
-    if(nvsWriteCache.clientId[0] != '\0') {
-      preferences.putString(PROPERTY_CLIENT_ID, nvsWriteCache.clientId);
-    }
-    if(nvsWriteCache.clientSecret[0] != '\0') {
-      preferences.putString(PROPERTY_CLIENT_SECRET, nvsWriteCache.clientSecret);
-    }
-    preferences.end();
-    ESP.restart();
-  }
-
-  if(oauthCode[0] != '\0') {
-    const char *newRefreshToken = NULL;
-
-    char callbackURI[100];
-    sprintf(callbackURI, callbackURItemplate, callbackURIProtocol, "sprfid.local", callbackURIAddress);
-
-    newRefreshToken = spotify->requestAccessTokens(oauthCode, callbackURI);
-
-    if (newRefreshToken != NULL)
-    {
-      Serial.println("Storing refresh token");
-      preferences.begin("sprfid", false);
-      preferences.putString(PROPERTY_REFRESH_TOKEN, newRefreshToken);
-      preferences.end();
-      strncpy(refreshToken, newRefreshToken, sizeof(refreshToken)-1);
-    }
-
-    oauthCode[0] = '\0';
-  }
-
-  if(clearNvs) {
-    preferences.begin("sprfid", false);
-    preferences.clear();
-    preferences.end();
-    ESP.restart();
-  }
+  processOAuth();
 
   if((spotify != NULL) && (refreshToken[0] != '\0')) {
     handleRfid();
 
     if(updateSpotify) {
-      playing = spotify->getCurrentlyPlaying("DE");
-
-      numDevices = spotify->getDevices(devices, sizeof(devices)/sizeof(devices[0]));
-      updateSpotify = false;
+     loadSpotifyState();
+     updateSpotify = false;
     }
   }
 }
